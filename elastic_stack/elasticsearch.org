@@ -1,0 +1,570 @@
+* Elastic Stack
+** ElasticSearch
+*** settings
+    可以通过拼接 ?flat_settings 参数来平铺展示结果，这是一个通用参数，适用于_cluster?flat_settings 等所有设置
+**** 静态设置
+
+**** 动态设置
+***** 动态映射
+      elasticsearch.yml
+      action.auto_create_index: false
+      action.auto_create_index: +shop_*,-user_*
+
+      动态修改自动创建索引方式如下:
+      #+begin_src json
+        PUT /_cluster/settings
+        {
+            "persistent": {
+                "action.auto_create_index": "false"
+            }
+        }
+      #+end_src
+***** 动态字段
+      dynamic来设置
+      #+begin_src json
+        PUT test
+        {
+            "mappings": {
+                "dynamic": "false/true/strict",
+                "properties": {
+                }
+            }
+        }
+      #+end_src
+      自动创建索引字段类型时json类型到elasticsearch类型
+     | json类型   | 字段类型            |
+     |------------+---------------------|
+     | null       | 不会添加新字段      |
+     | true/false | boolean             |
+     | 浮点数     | double              |
+     | integer    | long                |
+     | object     | object              |
+     | array      | 由数组首个元素决定  |
+     | string     | 多类型，text/keywor |
+
+     如果字符串中包含日期或数值，他们可以被解析为date或numeric类型
+     Elasticsearch默认对含有日期的字符串会自动解析为date类型，可以通过将映射类型的date_detection参数设置为false关闭
+     * 日期字符串在解析时使用的格式可以通过dynamic_date_formats设置，默认值["strict_date_optional_time", "yyyy/MM/dd HH:mm:ss Z||yyyy/MM/dd Z"]
+     * 含有数值的字符串默认不会被解析为数值类型，但可以通过numeric_detection参数开启数值解析
+     
+       
+**** 模版
+
+     #+begin_src json
+       PUT _template/user_tpl
+       {
+           "index_patterns": ["user*", "employee*"],
+           "aliases": {
+               "{index}_by_gender": {
+                   "filter": {
+                       "term": {
+                           "gender": "M"
+                       }
+                   }
+               }
+           },
+           "settings": {
+               "number_of_shards": 1
+           },
+           "mappings": {
+               "properties": {
+                   "gender": {
+                       "type": "keyword"
+                   }
+               }
+           }
+       }
+     #+end_src
+**** _split
+     _split接口做动态扩容需要预先设置索引的 **number_of_routing_shards** 参数，
+     Elasticsearch向分片散列文档采用一致性哈希算法，这个参数实际上设置了索引分片散列空间，
+     所以分裂后分片数量必须是 **number_of_routing_shards** 的因数，同时是 **number_of_shards**的倍数。
+     #+begin_example
+     例子：
+     number_of_routing_shards: 12
+     number_of_shards: 2
+     2 -> 4 -> 12
+     2 -> 6 -> 12
+     2 -> 12
+     三种可能的方式
+     #+end_example
+
+     #+begin_src json
+       DELETE Employee
+       PUT Employee
+       {
+           "settings": {
+               "number_of_shards": 2,
+               "number_of_routing_shards": 12
+           }
+       }
+       
+       PUT /employee/_settings
+       {
+           "blocks.write": true
+       }
+       
+       PUT /employee/_split/splited_employee
+       {
+           "settings": {
+               "index.number_of_shards": 4,
+               "index.number_of_replicas": 1,
+               "index.blocks.write": false
+           },
+           "aliases": {
+               "stu": {}
+           }
+       }
+       
+     #+end_src
+**** 缓存机制
+     缓存的问题
+     * 一致性：通过让缓存与索引刷新频率保持一致实现的。
+     * 容量超限： LRU
+     Elasticsearch 还提供了一个 _cache接口用于主动清理缓存。之所以要提供这个接口，是因为Elasticsearch为索引提供了一个主动刷新的接口_refresh,
+     所以最好在主动刷新索引后再主动清理缓存.
+***** 节点查询缓存(Node Query Cache)
+      负责存储节点查询结果。一个节点只有一个缓存，同一个节点上的分片共享同一缓存
+      默认开启，通过 index.queries.cache.enabled 参数关闭。
+      默认使用节点内存的10%作为缓存容量上限，可通过indices.queries.cache_size更改，这个参数是节点的配置而非索引配置
+      
+***** 分片请求缓存(Shard Request Cache)
+      一般只缓存聚集查询的相关结果。
+      默认开启，通过索引 index.requests.cache.enable参数关闭，另外一种关闭该缓存的办法是在调用_search接口时添加request_cache=false参数。
+      key 是作为查询条件json字符串，所以如果查询条件json完全相同，文档的查询极狐可以达到实时。但由于json属性质检并没有次序要求，这意味着
+      即使json描述的是同一个对象，只要它们的属性的次序不同就不能在缓存中命中数据。
+***** text类型字段在开启fielddata机制后使用的缓存
+      它会将text类型字段提取的所有词项全部加载到内存中，以提高使用该字段做排序和聚集运算的效率。
+      fielddata是text类型对文档值机制的代替，所以天然是开启的且不能关闭。可以通过 indices.fielddata.cache.size设置这个缓存的容量
+      默认情况下该缓存没有容量上限。
+***** _refresh接口
+      可以对一个或多个索引调用
+      #+begin_src 
+      get employee/_refresh
+      post _refresh
+      get _all/_refresh
+      post employee,students/_refresh
+      #+end_src
+***** _cache接口
+      #+begin_src
+       post /employee/_cache/clear     // 清理所有缓存
+       post /employee/_cache/clear?query=true   // 清理节点查询缓存
+       post /employee/_cache/clear?request=true // 清理分片请求缓存
+       post /employee/_cache/clear?fieldata=true&fields=notes // 清理fielddata缓存中notes字段的缓存
+      #+end_src
+**** 操作文档
+     * 获取单个文档
+       #+begin_src
+         get test/_source/1    // es7引入的方式
+         get /test/_doc/1/_source
+         get /test/_doc/1?_source=false
+         get /students/_doc/1?_source=name,age
+         get /students/_source/1/?_source_includes=gender&_source_exclueds=name
+       #+end_src
+       注意：
+       根据文档id查看文档时接口满足实时性要求。如果文档已经更新但未被编入索引，该接口在执行查询前会先刷新索引。
+       如果不希望这个接口做这种实时性刷新，可以通过参数realtime=false来禁止实时刷新
+     * 获取多个文档
+       [[https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-multi-get.html]]
+       通过_mget接口来实现。_mget接口根据索引名称和文档_id获取多个文档，可以使用get或post方式请求该接口。
+       在请求地址中可以指定一个或多个索引，也可以不包含索引，而是在请求体中通过docs参数指明索引和_id。
+       #+begin_src json
+       GET _mget
+       {
+         "docs": [
+         {
+           "_index": "students",
+           "_id": "1",
+           "_source": {
+              "include": ["name"],
+              "exclude": ["gender"]
+           }
+         },
+         {
+           "_index": "articles",
+           "_id": "2"
+         }]
+       }
+       #+end_src    
+
+       #+begin_src
+         GET /test/_doc/_mget?realtime=false
+         {
+           "ids": [1, 2]
+         }
+       #+end_src
+     * 删除文档
+       通过id或query来删除指定文档
+       删除文档时，也可以跟更新文档类似指定版本号，以确保要删除的文档在删除时没有更改。不仅如此，删除操作也会导致文档版本好增加。
+       已删除文档的版本号在删除后短时间内仍然可以控制并发，可用时长由索引的配置项index.gc_delete设置，默认是60s。
+       
+     * 更新
+       _update接口在文档不存在的时候提示错误，如果希望在文档不存在时创建文档，则可以在请求中添加upsert参数或doc_as_upsert参数。
+
+       #+begin_example
+       post /students/_update/5
+       {
+         "doc": {
+           "gender": "M"
+         },
+         "upsert": {
+           "name": "John",
+           "gender": "M"
+         }
+       }
+
+       post /students/_update/6
+       {
+         "doc": {
+           "gender": "M"
+         },
+         "doc_as_upsert": true
+       }
+       #+end_example
+       脚本更新时上下文变量（表3-5）
+      | 变量名称        | 变量类型 | 是否只读 | 说明                                 |
+      |-----------------+----------+----------+--------------------------------------|
+      | params          | Map      | 是       | 自定义参数                           |
+      | ctx['_op']      | String   | 否       | 操作名称，可更改为index,none或delete |
+      | ctx['_routing'] | String   | 是       | 路由值                               |
+      | ctx['_index']   | String   | 是       | 索引名称                             |
+      | ctx['_type']    | String   | 是       | 索引类型                             |
+      | ctx['_id']      | String   | 是       | 文档id                               |
+      | ctx['_version'] | integer  | 是       | 文档版本                             |
+      | ctx['_now']     | long     | 是       | 当前系统时间                         |
+      | ctx['_source']  | Map      | 否       | 源文档，可通过修改该参数值修改源文档 |
+      |                 |          |          |                                      |
+       
+      #+begin_src json
+        post /students/_update/1
+        {
+            "script": {
+                "source": """
+                   if(ctx._source.age > 24) {
+                       ctx['_op'] = 'delete'
+                   } else {
+                       ctx['_op'] = 'none'
+                   }
+                 """
+            }
+        }
+      #+end_src
+      当执行的操作为none时，在返回结果中会包含noop;而执行删除时，在返回结果中将包含delete.
+      与_update接口类似，如果请求文档不存在，Elasticsearch会返回文档不存在的错误提示。
+      如果希望在文档不存在时自动将文档插入，可以将scripted_upsert参数设置为true,或者使用upsert参数中加入要插入的文档内容。
+       * _update_by_query
+         #+begin_src json
+           post /students/_update_by_query
+           {
+               "script": {
+                   "source": "ctx._source.age ++"
+               },
+               "query": {
+                   "exists": {
+                       "field": "age"
+                   }
+               }
+           }
+         #+end_src
+         注意：上下文变量除了ctx['_now']不可使用以外，其余在表3-5中提及的变量均可以使用。
+
+     * 批量操作
+       #+begin_src json
+         post _bulk
+         {"index": {"_index": "students", "_id": "10"}}
+         {"name": "smith"}
+         {"delete": {"_index": "test", "_id": "5"}}
+         {"create": {"_index": "test", "_id": "11"}}
+         {"age": 30, "name": "Candy"}
+         {"udpate": {"_id": "1", "_index": "students"}}
+         {"doc": {"age": "20"}}
+       #+end_src
+*** 文档分析与检索
+    _search, _count, _msearch, _scripts; _validate, _explain, _field_caps, _search_shards等
+**** _search
+     查询值会在检索前通过分析器拆分为词项，在检索时只要字段中包含任意一个词项就视为满足条件，在实现上，
+     这其实是使用了DSL语言中定义的matcha查询。如果使用双引号将他们括起来，_search接口将使用DSL的match_phrase做短语匹配。
+     从效果上看就类似于用整个短语做检索，而不是使用单个词项做检索。查询值中除了包含词项本身以外，还可以包含操作符OR或AND，
+     注意它们必须大写否则将被识别为词项。
+
+     表4-1查询字符串查询值的特殊用法
+    | 类别       | 示例               | 说明                                                     |
+    |------------+--------------------+----------------------------------------------------------|
+    | 通配符     | qu?ckbro*          | 问号代表一个字符，星号代表0个或多个字符                  |
+    |------------+--------------------+----------------------------------------------------------|
+    | 正则表达式 | /joh?n(athp[oa]n)/ | 正则表达式需要定义在/和/之间                             |
+    |------------+--------------------+----------------------------------------------------------|
+    | 模糊查询   | quike~ brwn~1      | 默认编辑距离是2，可加数字指定编辑距离                    |
+    |------------+--------------------+----------------------------------------------------------|
+    | 短语查询   | "fox quick" ~5     | 使用双引号声明短语查询，使用数字表明次序的最大编辑距离   |
+    |------------+--------------------+----------------------------------------------------------|
+    | 范围查询   | count:[1 TO 5]     | 日期、数字、字符串可以指定一个范围，使用[]代表包含边界值 |
+    |            | count:[10 TO * ]   | 使用{}代表不包含边界值                                   |
+     
+    表4-2 基于URI的_search接口参数
+    | 参数名称                     | 默认值 | 说明                                                                              |
+    |------------------------------+--------+-----------------------------------------------------------------------------------|
+    | q                            | \      | 查询字符串                                                                        |
+    | df                           | \      | 在查询中没有定义字段前缀时使用的默认字段                                          |
+    | analyzer                     | \      | 分析查询字符串时使用的分析器名称                                                  |
+    | analyzer_wildcard            | false  | 通配符和前缀查询是否做分析                                                        |
+    | batched_reduce_size          | \      | 在协调节点上英减少的分片结果数量                                                  |
+    | default_operator             | OR     | 默认操作符，可以是 AND 或 OR                                                      |
+    | lenient                      | false  | 是否忽略格式错误，如数字、日期                                                    |
+    | explain                      | \      | 返回结果是否包含如何计算相似度分数的说明                                          |
+    | _source                      | \      | 结果是否包含_source字段，还可使用_source_include和_source_exlucde检索文档的一部分 |
+    | stored_fields                | \      | 使用逗号分割的存储字段名称，它们将在结果中返回                                    |
+    | sort                         | \      | 返回文档如何排序                                                                  |
+    | track_scores                 |        | 排序时设置为true, 以跟踪分数并将其返回                                            |
+    | track_total_hits             | true   | 设置为false，以禁用对匹配查询总次数的跟踪                                         |
+    | timeout                      | \      | 搜索超时时间                                                                      |
+    | terminate_after              | \      | 每个分片搜集文档的最大数量，达到该数量时查询将提前终止                            |
+    | from                         | 0      | 从那条文档开始查询                                                                |
+    | size                         | 10     | 返回多少条                                                                        |
+    | search_type                  |        | 执行搜索的类型，包括dfs_query_then_fetch(默认值), query_then_fetch                |
+    | allow_partial_search_results | true   | 是否允许返回部分结果，即在超时或部分分片失败的情况下是否返回已经成功的部分结果    |
+     
+**** 分页与排序
+***** from/size参数
+      from + size 不能超过index.max_result_window这个索引配置项设置的值, 默认是10000。
+
+***** scroll参数
+      scroll既是_search接口的参数也是接口，它提供了一种类似数据库游标的文档遍历机制，一般用于非实时性的海量文档处理需求。
+      1. 创建游标
+      2. 对游标遍历
+      #+begin_src json
+        POST kibana_sample_data_logs/_search?scroll=2m&size=100
+        {
+            "query": {
+                "term": {
+                    "message": "chrome"
+                }
+            }
+        }
+      #+end_src
+      其中，scroll参数只能在URI中使用，而不能出现在请求体中。它定义了检索生成的游标需要保留多长时间，比如2m代表2分钟，1h代表1小时。
+      scroll保留时长不是处理完所有数据所需要的时长，而是处理单词遍历所需要的时间。从性能角度来看，保留时间越短，空间利用率就越高，
+      所以应该根据单词处理能力设置这个值。
+      返回的 _scroll_id ，它唯一的代表了一个scroll查询的结果，接下来，根据这个_scroll_id就可以对结果进行遍历了。
+      #+begin_src json
+        POST _search/scroll
+        {
+            "scroll": "2m",
+            "scroll_id": "DX12gBA……A=="
+        }
+      #+end_src
+      游标的删除
+      #+begin_src json
+        DELETE _search/scroll
+        {
+            "scroll_id": "id1"
+        }
+        DELETE /_search/scroll/_all
+        
+        DELETE /_search/scroll/id2,id3
+      #+end_src
+      对scroll再做片段分割，每一个分割后的片段又可以被独立使用
+      #+begin_src json
+        post kibana_sample_data_lights/_search?scroll=1m
+        {
+            "slice": {
+                "id": 0,
+                "max": 2
+            }
+        }
+      #+end_src
+***** stored_fields参数
+      除了使用_source字段过滤可以出现在源文档中的字段以外，还可以使用stored_fields字段指定哪些被存储的字段
+      出现在结果中。当然这些字段的store属性要设置为true,否则即使在stored_fields中设置了它们，也会被忽略。
+      #+begin_src json
+        POST articles/_search
+        {
+            "stored_fields": ["author", "title"]
+        }
+      #+end_src
+      在返回的结果中会增加一个fields字段，其中包含了stored_fields中配置的字段值。此外，在使用stored_fields之后，
+      _source字段默认将不会出现在结果中，但可以通过将_source参数设置为true让它返回。
+      **字段的store参数：当文档某字段单独使用的频率额比较高而其他字段值占用空间又非常大时，就可以把这种常用的字段
+      单独保存起来使用。**
+***** docvalue_fields参数
+      docvalue_fields也是_search接口的参数，它用于将文档字段以文档值机制保存的值返回。
+      #+begin_src json
+        POST kibana_sample_data_flights/_search
+        {
+            "_source": "timestamp",
+            "docvalue_fields": [
+                {
+                    "field": "timestamp",
+                    "format": "epoch_millis"   // use_field_mapping关键字，表示用在索引mapping中定义的格式。
+                }
+            ]
+        }
+      #+end_src
+***** script_fields参数
+      script_fields同样是_search接口的参数，它可以通过脚本向检索结果中添加字段。
+      #+begin_src json
+        GET kibana_sample_data_flights/_search
+        {
+          "script_fields": {
+            "price_per_km": {
+              "script": {
+                "source": """
+                doc['AvgTicketPrice'].value / doc['DistanceKilometers'].value
+                """
+              }
+            }
+          }
+        }
+      #+end_src
+      表4-3 script_fields可使用脚本变量
+      | 参数名称       | 参数类型 | 是否只读 | 说明                   |
+      |----------------+----------+----------+------------------------|
+      | params         | Map      | 是       | 用户自定义参数         |
+      | doc            | Map      | 是       | 当前文档字段与值的映射 |
+      | ctx['_source'] | Map      | 否       | _source字段的映射      |
+      | _score         | double   | 是       | 相似度评分             |
+      |                |          |          |                        |
+
+
+**** 分析器与规整器
+     Analyzer
+     字符过滤器(Character Filter) -> 分词器(Tokenizer) -> 分词过滤器(Token Filter)
+     Normalizer
+     规整器与分析器的最大区别在于规整器没有分词起，而只有字符过滤器和分词过滤器，所以它能保证分析后的结果
+     只有一个分词。文档规整器只能用于字段类型是keyword的字段，可以通过字段的normalizer参数配置字段规整器。
+     规整器的作用就是对keyword字段做标准化处理，比如字段值转化为小写字母等等。
+     规整器与分析器共享相同的字符过滤器和词项过滤器，但规整器只能使用那些结果只有一个词项的过滤器。
+
+***** 设置分析器
+
+      #+begin_src json
+        PUT articles
+        {
+            "mappings": {
+                "properties": {
+                    "title": {
+                        "type": "text",
+                        "analyzer": "standard",
+                        "search_analyzer": "simple"
+                    }
+                }
+            }
+        }
+      #+end_src
+      创建索引时：如果没有指定分析器，elasticsearch会查找名为default的分析器，如果没有就使用standard分析器。
+      文档检索时：
+      1. 检索请求的analyzer参数；
+      2. 索引映射字段的search_analyzer参数；
+      3. 索引映射字段的analyzer参数；
+      4. 索引配置中的default_search参数；
+      如果都没有就使用 **standard** 分析器。
+      #+begin_src json
+        POST /articles/_search
+        {
+            "query": {
+                "match": {
+                    "title": {
+                        "query": "elastic search analyzer",
+                        "analyzer": "english"
+                    }
+                }
+            }
+        }
+      #+end_src
+***** _analyze接口
+      #+begin_src json
+        POST _analyze
+        {
+            "text": "elasticsearch logstash kibana beats",
+            "analyzer": "standard",
+            "explain": true
+        }
+      #+end_src
+      除了analyzer参数外，还可以使用tokenizer、filter、char_filter的组合来测试分词器、分词过滤器、字符过滤器的功能。
+***** _termvectors 接口
+      _termvectors接口提供了实时查看一段文本提取词项结果的功能，可以使用get或post方式请求该接口。该接口查看词项结果时
+      所使用的文本内容可以来自索引中某一文档的字段内容，也可以是在调用接口时动态指定一段文本。但只能二选一。
+      1. 在请求路径中指定文档_id, 并在路径或请求体中通过设置fields参数指定要查看的字段名称。
+         #+begin_src json
+           GET kibana_sample_data_logs/_termvectors/adsfcxxwef?fields=message
+           POST kibana_sample_data_logs/_termvectors/asdfasdf
+           {
+               "fields": ["message", "agent"]
+           }
+         #+end_src
+       2. 它的路径中一定不能包含文档_id, 而是在请求体中通过docs参数指定文本内容。
+         #+begin_src json
+           POST kibana_sample_data_logs/_termvectors
+           {
+               "doc": {
+                   "message": "kibana sample data logs message",
+                   "agent": "kibana sample dta logs agent"
+               }
+           }
+         #+end_src
+         Elasticsearch还提供了_mtermvector接口，可以一次查询多个文档的词项信息。这些文档甚至可以分散在不同的索引和映射类型中。
+         #+begin_src json
+           POST _mtermvectors
+           {
+               "docs": [
+                   {
+                       "_index": "kibana_sample_data_logs",
+                       "_id": "asdf",
+                       "fields": ["message", "agent"]
+                   },
+                   {
+                       "_index": "kibana_sample_data_flights",
+                       "_id": "Zlasdf",
+                       "fields": ["DestCountry"]
+                   }
+               ]
+           }
+         #+end_src
+**** 内置分析器与中文分析器
+
+***** standard分析器
+      1. 标准词项过滤器(Standard Token Filter): 只是占位，实际没有做任何处理；
+      2. 小写字母过滤器(Low Case Token Filter): 作用是将词项转换成小写字母；
+      3. 停止词过滤器(Stop Token Filter): 将停止词删除，默认关闭。
+      所以默认情况下，standard分析器的实际分词效果是使用Unicode文本分割规范提取词项并全部转换为小写。
+      表4-4 standard分析器配置参数
+      | 参数名称         | 默认值 | 说明                                                      |
+      |------------------+--------+-----------------------------------------------------------|
+      | max_token_length | 255    | 词项最大长度，超过这个长度将按该长度分为多个词项          |
+      | stopwords        | _none_ | 停止词数组，可使用内置停止词列表，比如_english_、_none_等 |
+      | stopwords_path   | \      | 停止词文件路径                                            |
+***** sotp分析器
+      表4-5 stop 分析器配置参数
+      | 参数名称       | 默认值    | 说明           |
+      |----------------+-----------+----------------|
+      | stopwords      | _english_ | 停止次列表     |
+      | stopwords_path | \         | 停止词文件路径 |
+       
+***** pattern分析器
+      pattern分析器使用模式分析器(Pattern Tokenizer, pattern), 该分词器使用Java正则表达式匹配文本以提取词项，
+      默认使用的正则表达式为"\W+", 即以非字母非数字作为分隔符。
+      patter分析器没有字符过滤器，但包含小写字母过滤器和停止词过滤器。这2个过滤器与standard分析器中的过滤器
+      完全一样，所以pattern分析器默认提取出来的词项也会被转换为小写并且不包含停止词。
+      表4-6 pattern分析器配置参数
+      | 参数名称       | 默认值 | 说明                                      |
+      |----------------+--------+-------------------------------------------|
+      | stopwords      | _none_ | 停止词列表                                |
+      | stopwords_path | \      | 停止词文件路径                            |
+      | pattern        | \W+    | Java正则表达式                            |
+      | flags          | \      | Java正则表达式的标识，用“｜” 组合多个标识 |
+      | lowercase      | true   | 是否转换为小写                            |
+       
+***** custom分析器
+      custom分析器可以理解为一个虚拟的分析器，不能直接使用。
+      char_filter、tokenizer、filter
+      由于分词器是分析器的必要组件，所以在配置custom分析器时tokenizer参数是必选项。
+       
+         
+      
+** 其他
+*** 占位符
+  | 占位符  | 使用位置  | 含义                                                                            |
+  |---------+-----------+---------------------------------------------------------------------------------|
+  | {index} | _template | 索引名称: "aliases": "{index}_by_gender": {"filter": {"term": {"gender": "M"}}} |
+  |         |           |                                                                                 |
+   
